@@ -1,15 +1,23 @@
 import re
-import time
+import os
 
 import backoff
 import pendulum
 import requests
 import singer
+from tenacity import retry, stop_after_delay, wait_exponential, retry_if_result, before_sleep
 
 
-# By default, jobs will run for 3 hours and be polled every 5 minutes.
-JOB_TIMEOUT = 60 * 180
-POLL_INTERVAL = 60 * 5
+# By default, jobs will run for 3 hours and be polled with exponential backoff.
+DEFAULT_JOB_TIMEOUT_SECS = 60 * 180
+JOB_TIMEOUT_SECS = os.getenv("JOB_TIMEOUT", DEFAULT_JOB_TIMEOUT_SECS)
+
+# Initial poll interval starts at 5 seconds
+DEFAULT_INITIAL_POLL_INTERVAL_SECS = 5
+INITIAL_POLL_INTERVAL_SECS = os.getenv("INITIAL_POLL_INTERVAL", DEFAULT_INITIAL_POLL_INTERVAL_SECS)
+
+DEFAULT_MAX_POLL_INTERVAL_SECS = 300
+MAX_POLL_INTERVAL_SECS = os.getenv("MAX_POLL_INTERVAL", DEFAULT_MAX_POLL_INTERVAL_SECS)
 
 # If Corona is not supported, an error "1035" will be returned by the API.
 # http://developers.marketo.com/rest-api/bulk-extract/bulk-lead-extract/#filters
@@ -82,8 +90,8 @@ class Client:
     def __init__(self, endpoint, client_id, client_secret,
                  max_daily_calls=None,
                  user_agent=DEFAULT_USER_AGENT,
-                 job_timeout=JOB_TIMEOUT,
-                 poll_interval=POLL_INTERVAL,
+                 job_timeout=JOB_TIMEOUT_SECS,
+                 poll_interval=INITIAL_POLL_INTERVAL_SECS,
                  request_timeout=REQUEST_TIMEOUT, **kwargs):
 
         self.domain = extract_domain(endpoint)
@@ -308,29 +316,50 @@ class Client:
         endpoint_name = "{}_stream".format(stream_type)
         return self.request("GET", endpoint, endpoint_name=endpoint_name, stream=True)
 
+    def _check_export_status(self, stream_type, export_id):
+        """Check export status and return True if still polling, False if done."""
+        status = self.poll_export(stream_type, export_id)
+        singer.log_info("export %s status is %s", export_id, status)
+
+        if status == "Created":
+            # If the status is created, the export has been made but
+            # not started, so enqueue the export.
+            self.enqueue_export(stream_type, export_id)
+            return False  # Continue polling
+
+        elif status in ["Cancelled", "Failed"]:
+            # Cancelled and failed exports fail the current sync.
+            raise ExportFailed(status)
+
+        elif status == "Completed":
+            return True  # Done polling
+
+        return False  # Continue polling for other statuses
+
+    @retry(
+        retry=retry_if_result(lambda x: x is False),
+        wait=wait_exponential(multiplier=1, min=INITIAL_POLL_INTERVAL_SECS, max=MAX_POLL_INTERVAL_SECS),
+        stop=stop_after_delay(JOB_TIMEOUT_SECS),
+        before_sleep=lambda retry_state: singer.log_info(
+            "Waiting %s seconds before next poll attempt for export %s",
+            retry_state.next_action.sleep if retry_state.next_action else 0,
+            retry_state.args[1] if len(retry_state.args) > 1 else "unknown"
+        )
+    )
+    def _poll_with_backoff(self, stream_type, export_id):
+        """Poll export status with exponential backoff."""
+        return self._check_export_status(stream_type, export_id)
+
     def wait_for_export(self, stream_type, export_id):
         # Poll the export status until it enters a finalized state or
-        # exceeds the job timeout time.
-        timeout_time = pendulum.utcnow().add(seconds=self.job_timeout)
-        while pendulum.utcnow() < timeout_time:
-            status = self.poll_export(stream_type, export_id)
-            singer.log_info("export %s status is %s", export_id, status)
-
-            if status == "Created":
-                # If the status is created, the export has been made but
-                # not started, so enqueue the export.
-                self.enqueue_export(stream_type, export_id)
-
-            elif status in ["Cancelled", "Failed"]:
-                # Cancelled and failed exports fail the current sync.
-                raise ExportFailed(status)
-
-            elif status == "Completed":
-                return True
-
-            time.sleep(self.poll_interval)
-
-        raise ExportFailed("Export timed out after {} minutes".format(self.job_timeout / 60))
+        # exceeds the job timeout time using exponential backoff.
+        try:
+            self._poll_with_backoff(stream_type, export_id)
+            return True
+        except Exception as e:
+            if "stop_after_delay" in str(type(e)):
+                raise ExportFailed("Export timed out after {} minutes".format(self.job_timeout / 60))
+            raise
 
     @handle_short_term_rate_limit()
     def test_corona(self):

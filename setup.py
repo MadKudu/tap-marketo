@@ -14,6 +14,7 @@ setup(name='tap-marketo',
           'requests==2.32.4',
           'pendulum==1.2.0',
           'backoff==2.2.1',
+          'tenacity==8.2.3',
       ],
       extras_require={
           'dev': [
